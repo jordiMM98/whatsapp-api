@@ -23,13 +23,18 @@ const client = new Client({
     }),
     puppeteer: {
         headless: true,
-        ...(process.env.PUPPETEER_EXECUTABLE_PATH ? { executablePath: process.env.PUPPETEER_EXECUTABLE_PATH } : {}),
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
+            '--disable-dev-shm-usage', // Obliga a usar disco en vez de RAM compartida
+            '--disable-accelerated-2d-canvas',
             '--no-first-run',
-            '--disable-gpu'
+            '--no-zygote',
+            '--disable-gpu',
+            '--disable-extensions', // Apaga cualquier extensión innecesaria
+            '--disable-software-rasterizer',
+            '--mute-audio', // Apaga el sistema de sonido
+            '--js-flags="--max-old-space-size=256"' // Obliga a Chrome a limpiar su memoria constantemente
         ]
     }
 });
