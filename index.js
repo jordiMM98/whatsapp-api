@@ -1,88 +1,72 @@
 'use strict';
 
 const express = require('express');
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode'); // Modificado para generar imagen web
-const cors = require('cors');     // Necesario para conectar con InfinityFree
-const path = require('path');
+const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const qrcode = require('qrcode');
+const cors = require('cors');
+const pino = require('pino'); // Necesario para silenciar los logs internos de Baileys
 
 const app = express();
-
-app.use(cors()); // Habilita conexiones desde tu panel
+app.use(cors());
 app.use(express.json({ limit: '20kb' }));
 
-// ESTADO DE WHATSAPP
-let whatsappListo = false;
+// VARIABLES DE ESTADO
 let estadoWhatsapp = 'iniciando';
-let qrActual = ''; // Aquí guardaremos la imagen del QR
+let qrActual = '';
+let sock; // Aquí vivirá nuestra conexión súper ligera
 
-// CONFIGURACIÓN DEL CLIENTE
-const client = new Client({
-    authStrategy: new LocalAuth({
-        dataPath: process.env.WWEBJS_AUTH_PATH || path.join(__dirname, '.wwebjs_auth')
-    }),
-    puppeteer: {
-        headless: true,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage', // Obliga a usar disco en vez de RAM compartida
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--disable-gpu',
-            '--disable-extensions', // Apaga cualquier extensión innecesaria
-            '--disable-software-rasterizer',
-            '--mute-audio', // Apaga el sistema de sonido
-            '--js-flags="--max-old-space-size=256"' // Obliga a Chrome a limpiar su memoria constantemente
-        ]
-    }
-});
+async function conectarWhatsApp() {
+    // Baileys guarda la sesión en una carpeta llamada 'baileys_auth_info'
+    const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
 
-// GENERAR QR (Para mostrarlo en tu panel)
-client.on('qr', async (qr) => {
-    whatsappListo = false;
-    estadoWhatsapp = 'esperando_qr';
-    
-    // Convertimos el QR a una imagen Base64 para enviarla a tu panel PHP
-    qrActual = await qrcode.toDataURL(qr);
-    console.log('📱 QR generado y listo para enviarse a la web.');
-});
+    sock = makeWASocket({
+        auth: state,
+        printQRInTerminal: false,
+        logger: pino({ level: 'silent' }), // Apagamos el texto basura en los logs de Render
+        browser: ['API Congregacion', 'Chrome', '1.0.0']
+    });
 
-// WHATSAPP AUTENTICADO
-client.on('authenticated', () => {
-    estadoWhatsapp = 'autenticado';
-    qrActual = ''; // Borramos el QR porque ya se vinculó
-    console.log('🔐 WhatsApp autenticado.');
-});
+    // Guardar credenciales automáticamente
+    sock.ev.on('creds.update', saveCreds);
 
-// WHATSAPP LISTO
-client.on('ready', () => {
-    whatsappListo = true;
-    estadoWhatsapp = 'conectado';
-    qrActual = '';
-    console.log('✅ WhatsApp conectado correctamente.');
-});
+    // Escuchar eventos de la conexión (QR, desconexión, éxito)
+    sock.ev.on('connection.update', async (update) => {
+        const { connection, lastDisconnect, qr } = update;
 
-// ERROR DE AUTENTICACIÓN
-client.on('auth_failure', (error) => {
-    whatsappListo = false;
-    estadoWhatsapp = 'error_autenticacion';
-    console.error('❌ Error de autenticación:', error);
-});
+        if (qr) {
+            estadoWhatsapp = 'esperando_qr';
+            qrActual = await qrcode.toDataURL(qr);
+            console.log('📱 QR generado y listo para enviarse al panel PHP.');
+        }
 
-// DESCONEXIÓN
-client.on('disconnected', (razon) => {
-    whatsappListo = false;
-    estadoWhatsapp = 'desconectado';
-    qrActual = '';
-    console.error('⚠️ WhatsApp desconectado:', razon);
-    
-    // Si se desconecta, reiniciamos para generar un nuevo QR
-    client.initialize(); 
-});
+        if (connection === 'close') {
+            const code = lastDisconnect.error?.output?.statusCode;
+            const reconectar = code !== DisconnectReason.loggedOut;
+            
+            estadoWhatsapp = 'desconectado';
+            qrActual = '';
+            
+            console.log('⚠️ Conexión cerrada. Código:', code);
 
-// CONSULTAR ESTADO DE LA API (Este lo leerá tu CRM en InfinityFree)
+            if (reconectar) {
+                console.log('🔄 Reconectando automáticamente en 3 segundos...');
+                setTimeout(conectarWhatsApp, 3000);
+            } else {
+                console.log('❌ Sesión cerrada por el usuario. Se pedirá un nuevo QR.');
+                setTimeout(conectarWhatsApp, 3000);
+            }
+        } else if (connection === 'open') {
+            estadoWhatsapp = 'conectado';
+            qrActual = '';
+            console.log('✅ WhatsApp conectado exitosamente sin usar Chrome (RAM a salvo).');
+        }
+    });
+}
+
+// Iniciar el ciclo de conexión
+conectarWhatsApp();
+
+// ENDPOINT 1: Consultar estado (Tu página PHP lee esto)
 app.get('/', (req, res) => {
     res.json({
         api: 'online',
@@ -91,36 +75,27 @@ app.get('/', (req, res) => {
     });
 });
 
-// ENDPOINT PARA ENVIAR MENSAJES (Sin Password, como pediste)
+// ENDPOINT 2: Enviar Mensajes
 app.post('/enviar', async (req, res) => {
     const { numero, mensaje } = req.body || {};
 
-    // VALIDAR DATOS
-    if (numero == null || typeof mensaje !== 'string' || !mensaje.trim()) {
-        return res.status(400).json({ status: 'error', message: 'Debe proporcionar número y mensaje.' });
+    if (!numero || typeof mensaje !== 'string' || !mensaje.trim()) {
+        return res.status(400).json({ status: 'error', message: 'Falta número o mensaje.' });
     }
 
-    // VERIFICAR WHATSAPP
-    if (!whatsappListo) {
-        return res.status(503).json({
-            status: 'error',
-            message: 'WhatsApp todavía no está conectado.',
-            whatsapp: estadoWhatsapp
-        });
+    if (estadoWhatsapp !== 'conectado') {
+        return res.status(503).json({ status: 'error', message: 'WhatsApp no está conectado.', whatsapp: estadoWhatsapp });
     }
 
-    // LIMPIAR NÚMERO
     const numeroLimpio = String(numero).replace(/\D/g, '');
     const numeroFinal = numeroLimpio.length === 10 ? `52${numeroLimpio}` : numeroLimpio;
-
-    // VALIDAR FORMATO
-    if (!/^\d{11,15}$/.test(numeroFinal)) {
-        return res.status(400).json({ status: 'error', message: 'Número inválido. Incluya código de país.' });
-    }
+    
+    // Baileys usa el sufijo @s.whatsapp.net (Diferente a la otra librería)
+    const jid = `${numeroFinal}@s.whatsapp.net`;
 
     try {
-        const chatId = `${numeroFinal}@c.us`;
-        await client.sendMessage(chatId, mensaje.trim());
+        // Enviar el mensaje
+        await sock.sendMessage(jid, { text: mensaje.trim() });
         console.log(`✅ Mensaje enviado a ${numeroFinal}`);
         return res.status(200).json({ status: 'ok', message: `Mensaje enviado a ${numeroFinal}` });
     } catch (error) {
@@ -129,24 +104,8 @@ app.post('/enviar', async (req, res) => {
     }
 });
 
-// INICIAR SERVIDOR
-const PORT = Number(process.env.PORT) || 3000;
-const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 API corriendo en el puerto ${PORT}`);
-});
-
-// INICIAR CLIENTE DE WHATSAPP
-client.initialize().catch((error) => {
-    whatsappListo = false;
-    estadoWhatsapp = 'error_inicializacion';
-    console.error('❌ Error al iniciar WhatsApp:', error);
-    server.close(() => { process.exit(1); });
-});
-
-// CIERRE CONTROLADO
-process.on('SIGTERM', async () => {
-    console.log('⚠️ Cerrando servicio...');
-    whatsappListo = false;
-    try { await client.destroy(); } catch (error) { console.error('Error al cerrar WhatsApp:', error.message); }
-    server.close(() => { process.exit(0); });
+// Levantar el servidor web
+const PORT = Number(process.env.PORT) || 10000;
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Servidor súper ligero corriendo en el puerto ${PORT}`);
 });
